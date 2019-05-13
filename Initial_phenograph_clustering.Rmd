@@ -1,0 +1,384 @@
+---
+title: "Initial clustering for DISCOV-R"
+author: "Virginia S. Muir"
+date: "9/5/2018"
+output: pdf_document
+---
+
+## ============================
+## Prepare environment
+## ============================
+
+```{r set_up, echo=FALSE, include=FALSE}
+# Set up the environment with required packages
+library(tidyverse)
+library(flowStats)
+library(flowCore)
+library(Rphenograph)
+library(Rtsne)
+library(igraph)
+library(ggthemes)
+library(gridExtra)
+
+# Session options
+options(stringsAsFactors = FALSE)
+set.seed(12345)
+
+# Set up the ggplot default params
+theme_set(theme_bw(12) + 
+          theme(panel.grid.major = element_blank(), 
+                panel.grid.minor = element_blank(),
+                plot.title = element_text(size=15, face="bold", margin = margin(10,0,10,0)),
+                axis.text.x = element_text(angle=45, hjust = 1)))
+cb_pal <- colorblind_pal()(8)[-1] 
+
+# Generate file structure in which to save R data and exports
+dir.create("Output")
+dir.create(file.path("Output", format(Sys.Date(), "%y%m%d")))
+dir.create(file.path("Output", format(Sys.Date(), "%y%m%d"), "R_objects"))
+dir.create(file.path("Output", format(Sys.Date(), "%y%m%d"), "tSNE_plots"))
+
+fname_prefix_R <- file.path("Output", format(Sys.Date(), "%y%m%d"), "R_objects", 
+                               format(Sys.Date(), "%y%m%d"))
+fname_prefix_tsne <- file.path("Output", format(Sys.Date(), "%y%m%d"), "tSNE_plots", 
+                               format(Sys.Date(), "%y%m%d"))
+
+```
+
+## ============================
+## Load & format data
+## ============================
+
+```{r import_and_format_data}
+## There are a couple of ways you can import your data, depending on which data you'd like to pull in.
+# List all files in the data folder named FCS
+all_files <- list.files("FCS", full.names = T, recursive = T)
+
+# List all files that end in .fcs anywhere in your working directory & its sub-directories
+#all_files <- list.files(pattern = ".fcs", full.names = T, recursive = T)
+
+# Subset to total CD8+ files (this looks in your list of files for perfect matches to the "CD8_T_Cells" string - capitilization must be consistent)
+cd8_files <- all_files[str_detect(all_files, pattern = "CD8_T_Cells")]
+
+# Subset to tmr+ files
+islet_tmr_files <- all_files[str_detect(all_files, "PPI_GAD_IAPP_IGRP.fcs")]
+insulin_tmr_files <- all_files[str_detect(all_files, "Ins.fcs")]
+viral_tmr_files <- all_files[str_detect(all_files, "CMV_EBV.fcs")]
+
+# Read in CD8+ and tmr+ fcs files to build flowSets
+build_fcsList <- function(file_list) {
+  tmp_list <- list()
+  for (fcs in file_list) {
+    if (str_detect(fcs, "xpb") == T) {
+      fcs_name <- paste(str_match(fcs, "xpb[0-9]+_(.*?)_")[2])
+    } else {
+      fcs_name <- paste("T1D-", str_match(fcs, "A02_([0-9]{5})_0")[2], sep="")
+    }
+    tmp_list[[fcs_name]] <- read.FCS(fcs, transformation = F)
+  }
+  tmp_list
+}
+
+cd8_files <- build_fcsList(cd8_files)
+islet_tmr_files <- build_fcsList(islet_tmr_files)
+insulin_tmr_files <- build_fcsList(insulin_tmr_files)
+viral_tmr_files <- build_fcsList(viral_tmr_files)
+#fcsNames = names(cd8_files)
+
+# Pull in key to correct inconsistent labels & to specify markers of interest
+key = read.csv("MarkerKey.csv", header = T)
+
+#Process data
+process_data <- function(fcs){
+
+  # Tidy marker names
+  fcs_key <- pData(parameters(fcs))
+  pData(parameters(fcs))$desc <- toupper(key$desc[match(fcs_key$name, key$name)])
+
+  # This changes parameters(fcs)$name, featureNames(fcs), and colnames(fcs) - aka events colnames - all in one fell swoop.
+  colnames(fcs) = make.names(pData(parameters(fcs))$desc)
+
+  # Remove markers that aren't in marker key list of 24 (i.e. duplicated NAs)
+  fcs = fcs[,!(duplicated(colnames(fcs)) | duplicated(colnames(fcs), fromLast = T))] 
+  fcs = fcs[, order(colnames(fcs))]
+}
+
+cd8_files <- lapply(cd8_files, process_data)
+islet_tmr_files <- lapply(islet_tmr_files, process_data)
+insulin_tmr_files <- lapply(insulin_tmr_files, process_data)
+viral_tmr_files <- lapply(viral_tmr_files, process_data)
+
+
+```
+
+
+```{r transform_and_extract_data}
+# Merge total and tmr+ expression data
+all_merged = cd8_files
+for(sample in unique(names(cd8_files))){
+  exprs(all_merged[[sample]]) = rbind(flowCore::exprs(cd8_files[[sample]]), 
+                                    if(!is.null(islet_tmr_files)) flowCore::exprs(islet_tmr_files[[sample]]), 
+                                    if(!is.null(insulin_tmr_files)) flowCore::exprs(insulin_tmr_files[[sample]]), 
+                                    if(!is.null(viral_tmr_files)) flowCore::exprs(viral_tmr_files[[sample]]))
+}
+
+# Transform the data
+asinh_tfm_data <- function(fcs){
+  # Arcsinh transform all remaining columns; Use b = 1/5 for CyTOF data, b = 1/150 for Flow data
+  tl <- transformList(colnames(fcs), arcsinhTransform(a=0, b=1/5), transformationId="asinh")
+  fcs = transform(fcs, tl) 
+}
+
+all_tfm <- lapply(all_merged, asinh_tfm_data)
+
+tfm_fs <- as(all_tfm, "flowSet")
+
+# Extract expression data and label Tmr+ events
+mergedExpr = setNames(data.frame(matrix(ncol = ncol(flowCore::exprs(tfm_fs[[1]]))+2, nrow = 0)),
+                      c(colnames(tfm_fs), "samp", "tmr_pos"))
+
+for(sample in names(cd8_files)){
+  tmp.expr = as.data.frame(flowCore::exprs(tfm_fs[[sample]]))
+  tmp.expr$samp = as.character(sample)
+  tmp.expr$tmr_pos = c(rep("no", nrow(flowCore::exprs(cd8_files[[sample]]))),
+                       if(!is.null(islet_tmr_files)) rep("islet", nrow(flowCore::exprs(islet_tmr_files[[sample]]))),
+                       if(!is.null(insulin_tmr_files)) rep("insulin", nrow(flowCore::exprs(insulin_tmr_files[[sample]]))),
+                       if(!is.null(viral_tmr_files)) rep("viral", nrow(flowCore::exprs(viral_tmr_files[[sample]]))))
+  mergedExpr = rbind(mergedExpr, tmp.expr)
+}
+
+# Check for donors with too many/too few collected events
+events_by_donor = mergedExpr %>%
+  group_by(samp) %>%
+  summarise(n_events = n())
+View(events_by_donor)
+
+
+```
+
+## ============================
+## Phenograph clustering + summarization
+## ============================
+
+```{r phenograph_clustering}
+# Create vector of markers that will be used for all downstream clustering
+clustering_markers <- toupper(key$desc)
+
+# Remove GZMB and CD160 since they have high CVs in the reproducibility testing
+clustering_markers = clustering_markers[!clustering_markers %in% c("GZMB","CD160")]
+
+# Set up Phenograph function to use kd tree (from JinmiaoChenLab/Rphenograph github)
+find_neighbors <- function(data, k){
+  nearest <- RANN::nn2(data, data, k, treetype = "kd", searchtype = "standard")
+  return(nearest[[1]])
+}
+
+Rpheno <- function(data, k=30){
+  if(is.data.frame(data))
+    data <- as.matrix(data)
+
+  if(!is.matrix(data))
+    stop("Wrong input data, should be a data frame or matrix!")
+
+  if(k<1){
+    stop("k must be a positive integer!")
+  }else if (k > nrow(data)-2){
+    stop("k must be smaller than the total number of points!")
+  }
+
+  message("Run Rphenograph starts:","\n",
+          "  -Input data of ", nrow(data)," rows and ", ncol(data), " columns","\n",
+          "  -k is set to ", k)
+
+  cat("  Finding nearest neighbors...")
+  t1 <- system.time(neighborMatrix <- find_neighbors(data, k=k+1)[,-1])
+  cat("DONE ~",t1[3],"s\n", " Compute jaccard coefficient between nearest-neighbor sets...")
+  t2 <- system.time(links <- Rphenograph:::jaccard_coeff(neighborMatrix))
+
+  cat("DONE ~",t2[3],"s\n", " Build undirected graph from the weighted links...")
+  links <- links[links[,1]>0, ]
+  relations <- as.data.frame(links)
+  colnames(relations)<- c("from","to","weight")
+  t3 <- system.time(g <- igraph::graph.data.frame(relations, directed=FALSE))
+
+  cat("DONE ~",t3[3],"s\n", " Run louvain clustering on the graph ...")
+  t4 <- system.time(community <- igraph::cluster_louvain(g))
+  cat("DONE ~",t4[3],"s\n")
+
+  message("Run Rphenograph DONE, took a total of ", sum(c(t1[3],t2[3],t3[3],t4[3])), "s.")
+  cat("  Return a community class\n  -Modularity value:", igraph::modularity(community),"\n")
+  cat("  -Number of clusters:", length(unique(igraph::membership(community))))
+
+  return(community)
+}
+
+# Run phenograph (using kd treetype) on each subject.
+PhenographClust = function(fcs, clustering_markers) {
+  exprs_mat = as.matrix(as.data.frame(flowCore::exprs(fcs))[,clustering_markers])
+  RPvect = as.numeric(igraph::membership(Rpheno(data = exprs_mat)))
+  return(RPvect)
+}
+
+mergedExpr$RPclust = unlist(lapply(all_tfm, PhenographClust, clustering_markers))
+
+# Get summary of the number of clusters generated for each subject
+n_pheno_clusts <- mergedExpr %>%
+  group_by(samp) %>%
+  summarize(k_clusters = max(RPclust))
+
+View(n_pheno_clusts)
+
+```
+
+## ============================
+## Summarize phenograph output
+## ============================
+
+```{r phenograph_cluster_mean_calculations}
+# Calculate mean expression value of each marker for each phenograph cluster in each subject
+RP_mean <- mergedExpr %>%
+  dplyr::select(-tmr_pos) %>%
+  group_by(samp, RPclust) %>%
+  summarise_all(mean) %>%
+  mutate(RPclust = as.character(RPclust))
+
+# Calculate total CD8 mean expression for each subject
+CD8_mean = mergedExpr %>%
+  dplyr::select(-tmr_pos, -RPclust) %>%
+  group_by(samp) %>%
+  summarise_all(mean) %>%
+  mutate(RPclust = "Total_CD8")
+
+RP_mean = bind_rows(RP_mean, CD8_mean)
+
+```
+
+
+```{r phenograph_cluster_cell_counts}
+# Count cells of each specificity in each phenograph cluster (from each sample)
+RPtmr_counting = mergedExpr %>% 
+  dplyr::select(samp, tmr_pos, RPclust) %>%
+  group_by(samp, RPclust) %>%
+  summarise(clust_size = n(), 
+            None = sum(tmr_pos=="no"), 
+            Islet = sum(tmr_pos=="islet"), 
+            Insulin = sum(tmr_pos=="insulin"), 
+            Virus = sum(tmr_pos=="viral"))
+
+aggregate_counts = RPtmr_counting %>%
+  dplyr::select(-RPclust) %>%
+  group_by(samp) %>%
+  summarise_all(sum) %>%
+  rename_at(vars(-samp),function(name) paste0(name,"_tot"))
+
+RPtmr_counting = RPtmr_counting %>%
+  left_join(aggregate_counts) %>%
+  mutate(pct_nonspec_in_clust = None/None_tot * 100,
+         pct_islet_in_clust = Islet/Islet_tot * 100,
+         pct_insulin_in_clust = Insulin/Insulin_tot * 100,
+         pct_virus_in_clust = Virus/Virus_tot * 100)
+
+# Save the clustering output
+pheno_filename = paste0(fname_prefix_R, "_all_phenograph_data.RData")
+save(mergedExpr, clustering_markers, RP_mean, RPtmr_counting, 
+     file = pheno_filename)
+
+```
+
+## ============================
+## tSNE clustering 
+## ============================
+
+You can skip this chunk (or try using UMAP) to speed things up.  It's unneccessary for DISCOV-R analysis but useful for visualization.
+
+If you do skip this chunk, you'll need to pull the X_all_phenograph_data.RData file in at the beginning of the DISCOV-R script instead of the X_all_phenograph_tsne_data.RData file.
+
+```{r tsne_clustering_by_subject}
+# Create function to run tSNE
+tsne_flowset <- function(fcs, selected_markers){
+  tsne_data <- as.data.frame(flowCore::exprs(fcs))
+
+  tsne_out <- tsne_data[,colnames(tsne_data) %in% selected_markers] %>%
+    as.matrix %>%
+    Rtsne(check_duplicates = F)
+
+  tsne_data$tsne_1 = tsne_out$Y[,1]
+  tsne_data$tsne_2 = tsne_out$Y[,2]
+
+  return(tsne_data)
+}
+
+# Run tSNE on each sample
+tsne_results <- lapply(all_tfm, tsne_flowset, selected_markers = clustering_markers)
+
+# Tidy the results and merge them with the rest of the expression data.
+tsne_results <- do.call("rbind", tsne_results)
+
+if(setequal(tsne_results[,clustering_markers], mergedExpr[,clustering_markers])==T) {
+  mergedExpr = mergedExpr %>%
+    left_join(tsne_results)
+  } else {
+    print("The expression data from mergedExpr and tsne_results do NOT match!!")
+  }
+
+# Save the output with the other important exports.
+tsne_filename = paste0(fname_prefix_R, "_all_phenograph_tsne_data.RData")
+save(mergedExpr, clustering_markers, RP_mean, RPtmr_counting,
+     file = tsne_filename)
+
+#load(tsne_filename)
+```
+
+
+```{r plot_tsne_data}
+# Plot insulin Tmr+ cells on each subject's tSNE plot
+InsBySubj = lapply(unique(mergedExpr$samp), function(x) {
+  ggplot(data = mergedExpr[mergedExpr$samp == x,], aes(x=tsne_1, y = tsne_2, color = factor(RPclust)))+
+    geom_point(size=1, alpha = 0.4)+
+    geom_point(data = mergedExpr[mergedExpr$samp == x & mergedExpr$tmr_pos == "insulin",],
+               size=2, color = "black", alpha = .7, shape = 15)+
+    scale_color_manual(values = colorRampPalette(cb_pal)(length(unique(mergedExpr$RPclust[mergedExpr$samp == x]))))+
+    labs(title=x, x="tsne 1", y="tsne 2")+
+    guides(color=guide_legend(ncol=2))+
+    theme(text = element_text(size=14))
+})
+grid_Ins = arrangeGrob(grobs = InsBySubj, ncol = 5)
+insulin_filename = paste0(fname_prefix_tsne, "_Insulin_tSNE_byDonor.pdf")
+ggsave(insulin_filename, grid_Ins, width = 29, height = 49)
+
+# Plot islet Tmr+ cells on each subject's tSNE plot
+IslBySubj = lapply(unique(mergedExpr$samp), function(x) {
+  ggplot(data = mergedExpr[mergedExpr$samp == x,], aes(x=tsne_1, y = tsne_2, color = factor(RPclust)))+
+    geom_point(size=1, alpha = 0.4)+
+    geom_point(data = mergedExpr[mergedExpr$samp == x & mergedExpr$tmr_pos == "islet",],
+               size=2, color = "black", alpha = 0.7, shape = 17)+
+    scale_color_manual(values = colorRampPalette(cb_pal)(length(unique(mergedExpr$RPclust[mergedExpr$samp == x]))))+
+    labs(title=x, x="tsne 1", y="tsne 2")+
+    guides(color=guide_legend(ncol=2))+
+    theme(text = element_text(size=14))
+})
+grid_Isl = arrangeGrob(grobs = IslBySubj, ncol = 5)
+iset_filename = paste0(fname_prefix_tsne, "_Islet_tSNE_byDonor.pdf")
+ggsave(iset_filename, grid_Isl, width = 29, height = 49)
+
+# Plot viral Tmr+ cells on each subject's tSNE plot
+VirBySubj = lapply(unique(mergedExpr$samp), function(x) {
+  ggplot(data = mergedExpr[mergedExpr$samp == x,], aes(x=tsne_1, y = tsne_2, color = factor(RPclust)))+
+    geom_point(size=1, alpha = 0.4)+
+    geom_point(data = mergedExpr[mergedExpr$samp == x & mergedExpr$tmr_pos == "viral",],
+               size=2, color = "black", alpha = 0.7, shape = 8)+
+    scale_color_manual(values = colorRampPalette(cb_pal)(length(unique(mergedExpr$RPclust[mergedExpr$samp == x]))))+
+    labs(title=x, x="tsne 1", y="tsne 2")+
+    guides(color=guide_legend(ncol=2))+
+    theme(text = element_text(size=14))
+})
+grid_Vir = arrangeGrob(grobs = VirBySubj, ncol = 5)
+viral_filename = paste0(fname_prefix_tsne, "_Viral_tSNE_byDonor.pdf")
+ggsave(viral_filename, grid_Vir, width = 29, height = 49)
+
+# Save plot objects so you can go back and print out a single subject's tSNE 
+plot_filename = paste0(fname_prefix_R, "_tsne_plot_objects.Rdata")
+save(InsBySubj, IslBySubj, VirBySubj, file = plot_filename)
+
+```
+

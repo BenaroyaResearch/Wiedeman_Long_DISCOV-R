@@ -1,0 +1,745 @@
+---
+title: "Metaclustering for DISCOV-R"
+author: "Virginia S. Muir"
+date: "9/21/2018"
+output: pdf_document
+---
+
+
+```{r set_up, echo=FALSE, message=FALSE, warning=FALSE}
+# Set up the environment with required packages
+library(ComplexHeatmap)
+library(circlize)
+library(tidyverse)
+library(magrittr)
+library(reshape2)
+library(ggthemes)
+library(viridis)
+library(RColorBrewer)
+library(ggmosaic)
+library(grid)
+library(gridExtra)
+library(hypergate)
+
+# Session options
+options(stringsAsFactors = FALSE)
+set.seed(12345)
+
+# Set up the ggplot default params
+theme_set(theme_bw(12) + 
+          theme(panel.grid.major = element_blank(), 
+                panel.grid.minor = element_blank(),
+                plot.title = element_text(size=15, face="bold", margin = margin(10,0,10,0)),
+                axis.text.x = element_text(angle=45, hjust = 1)))
+
+# Set up filename prefixes and output folders with the data
+dir.create("Output")
+dir.create(file.path("Output", format(Sys.Date(), "%y%m%d")))
+dir.create(file.path("Output", format(Sys.Date(), "%y%m%d"), "heatmaps"))
+dir.create(file.path("Output", format(Sys.Date(), "%y%m%d"), "mosaic_plots"))
+dir.create(file.path("Output", format(Sys.Date(), "%y%m%d"), "hypergate_scheme"))
+
+fname_prefix_hmap <- file.path("Output", format(Sys.Date(), "%y%m%d"), "heatmaps", 
+                               paste0(format(Sys.Date(), "%y%m%d"), "-Zscores-perSubj-YellowCyan"))
+fname_prefix_mosaic <- file.path("Output", format(Sys.Date(), "%y%m%d"), "mosaic_plots", 
+                                                 format(Sys.Date(), "%y%m%d"))
+fname_prefix_hgate = file.path("Output", format(Sys.Date(), "%y%m%d"), 
+                               "hypergate_scheme", "mc")
+
+# Set other session defaults
+linkage = "ward.D2" 
+distance = "euclidean" 
+export_width = 900
+export_height = 900
+title_font_gp = gpar(fontface = "bold", fontsize = 15)
+marker_label_gp = gpar(fontsize = 13)
+legend_params = list()
+tmrs = c("Islet", "Insulin", "Virus", "None")
+markers = c("KLRG1", "HELIOS", "TIM3", "CD25", "PD1", "CCR7", "CD45RO", 
+            "CD57", "CD45RA", "CD38", "CD127", "TIGIT", "CD27", "CD161",  
+            "TBET", "CD95", "NKG2D", "CD122", "EOMES", "CXCR3", "CD244", "CD56",
+            "CD160", "GZMB")
+
+```
+
+
+```{r get_shared_data}
+# Designate which data you'd like to load (all pheno, all pheno with tsne, all pheno with umap)
+data_path = file.path("Output", "180910", "R_objects", "180910_all_phenograph_tsne_data.RData")
+
+# Load data frame from initial clustering using RPhenograph
+load(data_path)
+
+# ID any samples that may have too few events.
+event_check = as.data.frame(table(mergedExpr$samp))
+event_check %>% dplyr::filter(Freq < 10000) %>% select(Var1) 
+
+# List of samples per Alice W. which should be removed from the analysis 
+drop_samples <- c("HC-09", "HC-10", "T1D-20397", "T1D-21868", "T1D-20692", "T1D-23876", "T1D-22457", 
+                  "T1D-26936", "T1D-21775", "T1D-25152", "T1D-28643", 
+                  #samples below were dropped with fewer than 10k events
+                  "pb13754374", "pb07912934", "pb28331071", "pb14577425") 
+  
+RPtmr_counting$RPclust <- as.character(RPtmr_counting$RPclust)
+RPtmr_counting = RPtmr_counting %>%
+  left_join(RP_mean, by = c("samp", "RPclust")) %>%
+  subset(!(samp %in% drop_samples))
+
+RP_mean = RP_mean %>% subset(!(samp %in% drop_samples))
+mergedExpr = mergedExpr %>% 
+  subset(!(samp %in% drop_samples)) %>%
+  mutate(RPclust = as.character(RPclust))
+
+# Identify low abundance clusters (containing <1% of events per subject) 
+RPtmr_counting = RPtmr_counting %>% 
+  group_by(samp) %>% 
+  mutate(total_events = sum(clust_size)) %>% 
+  ungroup() %>% 
+  mutate(pct_cells_in_clust = clust_size/total_events*100, 
+         keep = pct_cells_in_clust >= 1)
+ 
+# Filter out low abundance clusters (do this after calculating z-scores??)
+drop_clusters = dplyr::filter(RPtmr_counting, keep == F) %>%
+  select(samp, RPclust)
+
+RPtmr_counting = RPtmr_counting %>% anti_join(drop_clusters)
+mergedExpr = mergedExpr %>% anti_join(drop_clusters)
+RP_mean = RP_mean %>% anti_join(drop_clusters)
+
+# Compute the per-subject/per-cluster standard deviation so that I can later compute z-score
+RP_sd <- mergedExpr %>%
+  dplyr::select(-tmr_pos, -contains("tsne")) %>%
+  group_by(samp, RPclust) %>%
+  summarise_all(sd)
+
+# Calculate CD8 standard deviations for each sample
+CD8_sd <- mergedExpr %>%
+  dplyr::select(-tmr_pos, -RPclust, -contains("tsne")) %>%
+  group_by(samp) %>%
+  summarise_all(sd) %>%
+  mutate(RPclust = "Total_CD8")
+
+# Merge per-cluster and total CD8 standard deviations
+RP_sd = bind_rows(RP_sd, CD8_sd)
+
+# format mean/var data for ease of use
+sample_means = RP_mean %>%
+  dplyr::filter(RPclust == "Total_CD8") %>% 
+  dplyr::select(-RPclust) %>%
+  gather("marker", "subject_mean", -samp) %>%
+  dplyr::rename(subject = samp)
+
+sample_sds = RP_sd %>%
+  dplyr::filter(RPclust == "Total_CD8") %>% 
+  dplyr::select(-RPclust) %>%
+  gather("marker", "subject_sd", -samp) %>%
+  dplyr::rename(subject = samp)
+
+df_mean_var <-
+  left_join(sample_means, sample_sds, by = c("subject", "marker")) %>%
+  mutate(subject_var = subject_sd **2) 
+
+```
+
+```{r set_colors, echo=FALSE, message=FALSE, warning=FALSE}
+
+# Set up a palette for the heatmap
+my_zscore_pal <- colorRamp2(c(-2,0,2), c("#00ffffFF", "#000000FF", "#FDE725FF"))
+my_arcsinh_pal <- colorRamp2(c(0,3.1), c("#440154FF", "#FDE725FF"))
+
+# get subject ids, assign colors to them
+subject_ids <- sort(unique(RPtmr_counting$samp))
+subject_id_colors <- data.frame(subject = subject_ids,
+                                #color = rainbow(length(subject_ids)))
+                                color = c("#000000FF",
+                                  plasma(length(subject_ids)+2)[4:(length(subject_ids)+2)]))
+
+# pass_threshold_colors <- data.frame(pass = c(0:8), color = c("#FFFFFF", "#3F054E", "#409E9B", "#CC0101", "#3F054E", "#409E9B", "#CC0101", "#5DC762", "#FFFFFF"))
+ 
+# duration_colors <- data.frame(status = c("LS", "RO"), color = c("#2D297A", "#BB9C3E"))
+# progression_colors <- data.frame(status = c("Pre-slow", "Slow", "Unclassified", "Rapid", "Post-rapid"),
+#                                  color = c("#184349", "#368BA1", "#D3D3D3", "#5E9130", "#21632E"))
+
+
+```
+
+## ==================================================================
+## Gather Clusters from Subjects (both containing and excluding Tmrs)
+## ==================================================================
+
+```{r get_all_cluster_data}
+
+# prepare data for each tmr
+df_sig_list <- list()
+hmap_df_list <- list()
+persub_zscore_list <- list()
+persub_arcsinh_list <- list()
+
+for (t in tmrs){
+  # filter out clusters with no Tmr+ cells
+  df_sig_list[[t]] <-
+    RPtmr_counting %>%
+    dplyr::rename(subject = samp) %>%
+    dplyr::filter_(paste0(t, " > 0"))
+
+  # set up data frames for plotting
+  hmap_df_list[[t]] <-
+    df_sig_list[[t]] %>%
+    dplyr::select(subject, RPclust, one_of(markers)) %>%
+    melt(id.vars = c("subject", "RPclust")) %>% 
+    dplyr::rename(marker = variable, mean = value) %>%
+    merge(df_mean_var, by=c("subject", "marker")) %>%
+    mutate(zscore_persub = (mean - subject_mean)/subject_sd,
+           arcsinh_persub = mean,
+           sample = paste0(.$subject, "_", .$RPclust)) %>%
+    dplyr::select(marker, zscore_persub, arcsinh_persub, sample)
+  
+  # Extract the z-scores
+  persub_zscore_list[[t]] <-
+    hmap_df_list[[t]] %>%
+    dcast(marker ~ sample, value.var = "zscore_persub") %>%
+    set_rownames(.$marker) %>%
+    dplyr::select(-marker)
+  
+  # Extract the arcsinh transformed fluorescence values
+  persub_arcsinh_list[[t]] <- 
+    hmap_df_list[[t]] %>%
+    dcast(marker ~ sample, value.var = "arcsinh_persub") %>%
+    set_rownames(.$marker) %>%
+    dplyr::select(-marker)
+ 
+}
+
+```
+
+##====================================
+## Combine all Subjects all Clusters
+##====================================
+
+```{r get_all_tmr_clusters_data}
+
+# load expression data, select all unique clusters 
+df_all_tmr <- NULL
+for (t in tmrs){
+  df_all_tmr <- rbind(df_all_tmr, df_sig_list[[t]]) %>% unique
+}
+
+## Include regardless of colorbar visualization
+clust_sig_pass <-
+  df_all_tmr %>%
+  select(subject, RPclust, tmrs) %>%
+  mutate(sample = paste0(.$subject, "_", .$RPclust))
+
+tmr_counting <- clust_sig_pass %>% select(sample, tmrs)
+
+
+## Include to show % of Tmrs/Specificity present in a cluster for each individual 
+clust_sig_pass %<>% group_by(subject) %>%
+  mutate(tot_isl = sum(Islet), tot_ins = sum(Insulin),
+         tot_vir = sum(Virus), tot_none = sum(None)) %>%
+  ungroup() %>%
+  mutate(Islet = Islet/tot_isl, Insulin = Insulin/tot_ins,
+         Virus = Virus/tot_vir, None = None/tot_none)
+
+clust_sig_pass[,3:6] %<>% sapply(round, digits = 2)
+
+clust_sig_pass %<>% select(sample, tmrs)
+
+## Create data object
+hmap_df_all_tmr <- 
+  df_all_tmr %>%
+  select(subject, RPclust, one_of(markers)) %>% 
+  melt(id.vars = c("subject", "RPclust")) %>% 
+  dplyr::rename(marker = variable, mean = value) %>%
+  merge(df_mean_var, by=c("subject", "marker")) %>%
+  ## Apply z-score here!
+  mutate(zscore_persub = (mean - subject_mean)/subject_sd,
+         arcsinh_persub = mean,
+         sample = paste0(.$subject, "_", .$RPclust)) %>%
+  select(sample, subject, marker, zscore_persub, arcsinh_persub) %>%
+  merge(clust_sig_pass, by="sample")
+ 
+
+# Extract the z-scores for all subjects
+all_tmr_all_sub_persub_zscores <-
+  hmap_df_all_tmr %>%
+  subset(marker != "GZMB" & marker != "CD160") %>%
+  dcast(marker ~ sample, value.var = "zscore_persub") %>%
+  set_rownames(.$marker) %>%
+  select(-marker)
+
+# extract the z-scores for each subject, and mark which clusters pass the threshold
+all_tmr_persub_zscores <- list()
+for (s in unique(hmap_df_all_tmr$subject)){
+  all_tmr_persub_zscores[[s]] <- 
+    hmap_df_all_tmr %>%
+    subset(marker != "GZMB" & marker != "CD160") %>%
+    dplyr::filter(subject == s) %>%
+    dcast(marker ~ sample, value.var = "zscore_persub") %>%
+    set_rownames(.$marker) %>%
+    select(-marker)
+}
+
+
+# Extract the arcsinh fluorescence values for all subjects
+all_tmr_all_sub_persub_arcsinh <-
+  hmap_df_all_tmr %>%
+  dcast(marker ~ sample, value.var = "arcsinh_persub") %>%
+  set_rownames(.$marker) %>%
+  select(-marker)
+
+# extract the arcsinh fluorescence values for each subject, and mark which clusters pass the threshold
+all_tmr_persub_arcsinh <- list()
+for (s in unique(hmap_df_all_tmr$subject)){
+  all_tmr_persub_arcsinh[[s]] <- 
+    hmap_df_all_tmr %>%
+    dplyr::filter(subject == s) %>%
+    dcast(marker ~ sample, value.var = "arcsinh_persub") %>%
+    set_rownames(.$marker) %>%
+    select(-marker)
+}
+
+```
+
+##====================================
+## Create metacluster & summary heatmaps
+##====================================
+
+```{r enriched_cluster_zscore_hmap_by_tmr_mario}
+
+all_tmr_zscore_anno_df <- 
+  hmap_df_all_tmr %>% 
+  select(sample, tmrs) %>%
+  unique %>%
+  slice(match(colnames(all_tmr_all_sub_persub_zscores), .$sample)) %>% 
+  mutate(sample = str_replace(.$sample, "_[0-9]+$", "")) %>%
+  rename(subject = sample) # %>%
+  # left_join(select(clinical_vars, ID, progression = `Progression rate`, duration = Duration), by = c("subject" = "ID"))
+
+my_hm <- Heatmap(all_tmr_all_sub_persub_zscores,
+          clustering_method_columns = linkage,
+          clustering_method_rows = linkage)
+  
+# cut the dendrogram to get phenotypic metaclusters
+n_metaclusters = 12
+col_clust <- as.hclust(column_dend(my_hm))
+col_indices <- cutree(col_clust, k = n_metaclusters)
+ordered_indices <- col_indices[column_order(my_hm)]
+k_groups <- length(unique(col_indices))
+  
+plot_tmrs = c("Islet") # , "Insulin", "Virus"
+
+# set up colors as a named list
+all_tmr_zscore_anno_colors <- list(subject = setNames(subject_id_colors$color,
+                                                as.character(subject_id_colors$subject)),
+                                   group = setNames(brewer.pal(k_groups, "Set3"),
+                                            as.character(unique(col_indices)))) #,
+                                   # group = setNames(viridis(k_groups),
+                                   #          as.character(unique(col_indices)))) # original viridis scheme
+
+# add metacluster information to tmr counting information
+tmr_counting = tmr_counting %>%
+  left_join(data.frame(sample = colnames(all_tmr_all_sub_persub_zscores), group = col_indices))
+
+## Use for presence/enrichment of tmrs color scheme
+# for (t in plot_tmrs){
+#   all_tmr_zscore_anno_colors[[t]] = setNames(pass_threshold_colors$color, pass_threshold_colors$pass)
+# }
+
+## Use for number tmrs color scheme
+# for (t in plot_tmrs){
+#   tmr_vect = all_tmr_zscore_anno_df %>% select(t) %>% unlist(use.names = FALSE)
+#   all_tmr_zscore_anno_colors[[t]] = c(setNames("#888888", 0), setNames(colorRampPalette(brewer.pal(9, "Greens")[2:9])(max(tmr_vect)),
+#                             1:(max(tmr_vect))))
+# }
+# all_tmr_zscore_anno_df_counting = data.frame(subject = all_tmr_zscore_anno_df[,1], group = col_indices,
+#                                     all_tmr_zscore_anno_df[,2:ncol(all_tmr_zscore_anno_df)])
+ 
+## Use for pct tmrs color scheme
+for (t in plot_tmrs){
+  tmr_vect = all_tmr_zscore_anno_df %>% select(t) %>% unlist(use.names = FALSE)
+  # all_tmr_zscore_anno_colors[[t]] = c(setNames("white", 0), 
+  #                                     setNames(colorRampPalette(c("grey90", "grey30"))(19), seq(0.01, 0.19, 0.01)),
+  #                                     setNames(rep("black", 81), seq(0.20, 1.00, 0.01)))
+  all_tmr_zscore_anno_colors[[t]] = c(setNames("white", 0), 
+                                      setNames(colorRampPalette(c("grey95", "grey0"))(100), seq(0.01, 1.00, 0.01)))
+}
+
+
+all_tmr_zscore_anno_df %<>% mutate(group = col_indices) %>%
+  select(subject, group, Islet)
+
+all_tmr_zscore_anno <- 
+  HeatmapAnnotation(
+    df = data.frame(all_tmr_zscore_anno_df),
+    col = all_tmr_zscore_anno_colors,
+    show_annotation_name = T,
+    show_legend = F)
+    # annotation_legend_param = list(Islet = list(ncol = 4, title_position = "topcenter"),
+    #                                group = list(ncol = 2, title_position = "topcenter"),
+    #                                subject = list(ncol = 4, title_position = "topcenter")),
+    # show_legend = c(F, T, T, T, T))
+
+zscore_hmap <- Heatmap(all_tmr_all_sub_persub_zscores,
+        col = my_zscore_pal,
+        name = "z-score",
+        column_title = paste0("Cluster Phenotypes from All Subjects"),
+        column_title_gp = title_font_gp,
+        clustering_method_columns = linkage,
+        cluster_rows = T,
+        clustering_method_rows = linkage,
+        show_column_names = F,
+        row_names_gp = marker_label_gp,
+        top_annotation = all_tmr_zscore_anno,
+        heatmap_legend_param = legend_params)
+
+png(filename = paste0(fname_prefix_hmap, "_", linkage, "_", distance, "_", 
+                      "_AllClusters_cutree", n_metaclusters, "_pct_Tmr.png"),
+    width = export_width,
+    height = export_height)
+print(zscore_hmap)
+dev.off()
+
+marker_order = row_order(zscore_hmap)[[1]]
+
+png(filename = paste0(fname_prefix_hmap, "_", linkage, "_", distance, "_", 
+                      "_AllClusters_cutree", n_metaclusters, "_pct_tmrs_MFI.png"),
+    width = export_width,
+    height = export_height)
+print(Heatmap(all_tmr_all_sub_persub_arcsinh,
+        col = my_arcsinh_pal,
+        name = "MFI",
+        column_title = paste0("Cluster Phenotypes from All Subjects"),
+        column_title_gp = title_font_gp,
+        cluster_columns = F,
+        column_order = column_order(zscore_hmap),
+        cluster_rows = F,
+        row_order = c(markers[marker_order], "GZMB", "CD160"), 
+        split = rep(c("", " "), c(length(marker_order), 2)),
+        gap = unit(5, "mm"),
+        show_column_names = F,
+        row_names_gp = marker_label_gp,
+        top_annotation = all_tmr_zscore_anno,
+        heatmap_legend_param = legend_params))
+dev.off()
+
+
+# Weighted Average phenotype hmap - average of arcsinch values in each metacluster
+per_metax_avg <-
+  data.frame(t(all_tmr_all_sub_persub_arcsinh)) %>%
+  mutate(sample = rownames(.)) %>%
+  merge(tmr_counting, by = "sample") %>%
+  mutate(n_event = Islet + Insulin + Virus + None,
+         subj = str_remove(sample, "_.*"),
+         RP_clust = str_remove(sample, ".*_")) %>%
+  group_by(subj) %>%
+  mutate(subj_event = sum(n_event)) %>%
+  ungroup() %>%
+  mutate(proportion = n_event/subj_event) %>%
+  mutate_at(markers, funs(.*proportion)) %>%
+  select(-sample, -tmrs, -n_event, -subj, -RP_clust, -subj_event) %>%
+  group_by(group) %>%
+  summarise_all(sum) %>%
+  mutate_at(markers, funs(./proportion)) %>%
+  select(-group, -proportion) %>%
+  t
+
+colnames(per_metax_avg) = 1:n_metaclusters
+  
+# set up data frame for annotation bar for average hmap
+tmr_avg_anno_df <- 
+  data.frame(group = colnames(per_metax_avg))
+  
+# set up colors as a named list
+tmr_avg_anno_colors <- list(group = setNames(brewer.pal(k_groups, "Set3"),
+                                             as.character(colnames(per_metax_avg))))
+  
+tmr_avg_anno <- HeatmapAnnotation(df = tmr_avg_anno_df,
+                                  col = tmr_avg_anno_colors,
+                                  show_annotation_name = T,
+                                  show_legend = T)
+
+tmr_hm <- Heatmap(per_metax_avg,
+          col = my_arcsinh_pal,
+          name = "MFI",
+          column_title = paste0("Clusters Enriched for ", t, " Tmrs"),
+          column_title_gp = title_font_gp,
+          cluster_columns = F,
+          cluster_rows = F,
+          row_order = c(markers[marker_order], "GZMB", "CD160"), 
+          split = rep(c("", " "), c(length(marker_order), 2)),
+          gap = unit(5, "mm"),
+          combined_name_fun = NULL,
+          show_column_names = F,
+          row_names_gp = marker_label_gp,
+          top_annotation = tmr_avg_anno,
+          heatmap_legend_param = legend_params)
+
+  
+png(filename = paste0(fname_prefix_hmap, "_", linkage, "_rpheno_", t, "_arcsinh_weightedAvgByClust.png"),
+    width = 2500,
+    height = 2500,
+    res = 300)
+print(tmr_hm)
+dev.off()
+  
+## Weighted Average phenotype for total CD8s 
+  # weighted by proportion of cells in a subject (not by number of cells) in order to allow 
+  # equivalent contributions from subjects with disparate numbers of collected events 
+cd8_avg <- 
+  data.frame(t(all_tmr_all_sub_persub_arcsinh)) %>% 
+  mutate(sample = rownames(.)) %>%
+  merge(tmr_counting, by = "sample") %>%
+  mutate(n_event = Islet + Insulin + Virus + None,
+         subj = str_remove(sample, "_.*"),
+         RP_clust = str_remove(sample, ".*_")) %>%
+  group_by(subj) %>%
+  mutate(subj_event = sum(n_event)) %>%
+  ungroup() %>%
+  mutate(proportion = n_event/subj_event) %>%
+  mutate_at(markers, funs(.*proportion)) %>%
+  select(-sample, -tmrs, -n_event, -subj, -RP_clust, -subj_event) %>%
+  summarise_all(sum) %>%
+  mutate_at(markers, funs(./proportion)) %>%
+  select(-group, -proportion) %>%
+  t
+
+colnames(cd8_avg) = "CD8"
+  
+cd8_hm <- Heatmap(cd8_avg,
+        col = my_arcsinh_pal,
+        name = "MFI",
+        column_title = paste0("Total CD8+"),
+        column_title_gp = title_font_gp,
+        cluster_columns = F,
+        cluster_rows = F,
+        row_order = c(markers[marker_order], "GZMB", "CD160"), 
+        split = rep(c("", " "), c(length(marker_order), 2)),
+        gap = unit(5, "mm"),
+        combined_name_fun = NULL,
+        show_column_names = F,
+        row_names_gp = marker_label_gp,
+        heatmap_legend_param = legend_params)
+
+png(filename = paste0(fname_prefix_hmap, "_", linkage, "_CD8_arcsinh_weightedAvg.png"),
+    width = 700,
+    height = 2500,
+    res = 300)
+print(cd8_hm)
+dev.off()
+  
+``` 
+
+##====================================
+## Data export
+##====================================
+
+```{r wrangle_and_export_data}
+
+tmr_counting$RPclust = sapply(strsplit(tmr_counting$sample, "_"), tail, 1L) # extract everything after the last underscore
+tmr_counting$subject = str_remove(tmr_counting$sample, "_[0-9]+$") # strip final underscore and the digits that follow it
+
+events_w_metaclust = mergedExpr %>% 
+  left_join(select(tmr_counting, RPclust, samp = subject, metacluster = group)) 
+
+# Quick look to see which clusters might be interesting
+events_w_metaclust %>% 
+  group_by(metacluster) %>% 
+  summarise(tmrs = sum(tmr_pos == "islet"), total = n()) %>% 
+  mutate(enr = phyper(tmrs-1, 
+                      sum(events_w_metaclust$tmr_pos == "islet"), 
+                      nrow(events_w_metaclust)-sum(events_w_metaclust$tmr_pos == "islet"), 
+                      total, lower.tail = F))
+
+tmr_distrib_for_export = tmr_counting %>%
+  select(subject, metacluster = group, RPclust) %>%
+  left_join(select(df_all_tmr, subject, RPclust, clust_size, tmrs)) %>%
+  group_by(subject, metacluster) %>%
+  summarise(Islet = sum(Islet), Insulin = sum(Insulin),
+            Virus = sum(Virus), total_events = sum(clust_size)) %>% 
+  mutate(pct_Islet = Islet/sum(Islet), pct_Insulin = Insulin/sum(Insulin),
+         pct_Virus = Virus/sum(Virus), pct_total = total_events/sum(total_events)) 
+
+fn = paste0(fname_prefix_hmap, "_", linkage, "_", distance, "_", 
+                      n_metaclusters, "_Metaclust_summary.csv")
+write_csv(tmr_distrib_for_export, fn)    
+
+tmr_by_subj = tmr_counting %>%
+  dplyr::select(subject, tmrs) %>%
+  mutate(Total = Islet + Insulin + Virus + None) %>%
+  group_by(subject) %>%
+  summarise_all(sum) %>%
+  dplyr::rename(Islet_tot = Islet, Insulin_tot = Insulin, Virus_tot = Virus, None_tot = None)
+
+```
+
+##====================================
+## Hypergate to define Metaclusters
+##====================================
+
+```{r generate_plotting_strategy}
+# List metaclusters you'd like to run hypergate on
+metaclusters_for_hypergate = c(1, 11, 12)
+
+# Select subset of the data to run hypergate 
+#min_events = min(table(events_w_metaclust$samp)) # can use this if you have a lot of time/power
+min_events = 3000 # works well enough, will still take a fair amount of time
+
+ds_events = events_w_metaclust %>% 
+  group_by(samp) %>%
+  sample_n(min_events)
+
+# Create input expression matrix and MC ID vector for input  
+xp_mat = ds_events %>%
+  ungroup() %>%
+  dplyr::select(-samp, -tmr_pos, -RPclust, -contains("tsne"), -contains("umap"), -group) %>%
+  as.matrix()
+
+gate_vect = ds_events$group
+
+# Create hypergate function
+create_gates = function(metaclust_of_interest){
+  cat("Running hypergate on metacluster", metaclust_of_interest)
+  default_path = paste0(fname_prefix_hgate, metaclust_of_interest)
+
+  metaclust_gate = hypergate(xp_mat, gate_vect, level = metaclust_of_interest)
+  saveRDS(metaclust_gate, file = paste0(default_path, "_hypergate_result.RDS"))
+
+  # Get an idea of how the initial gating performs
+  predicted = subset_matrix_hg(metaclust_gate, xp_mat)
+  print(table(ifelse(predicted, "Gated-in", "Gated-out"), 
+              ifelse(gate_vect == metaclust_of_interest, "Events of interest", "Others")))
+  plot_gating_strategy(gate = metaclust_gate, xp = xp_mat, gate_vector = gate_vect, 
+      level = metaclust_of_interest, highlight = "firebrick3", 
+      path = paste(default_path, "initial_strategy.png", sep = "_"))
+
+  # Look at progression of F values during optimization
+  f_values_vs_number_of_parameters = c(F_beta(rep(TRUE, nrow(xp_mat)), 
+      gate_vect == metaclust_of_interest), metaclust_gate$f[c(apply(metaclust_gate$pars.history[, 
+      metaclust_gate$active_channels], 2, function(x) min(which(x != 
+      x[1]))) - 1, nrow(metaclust_gate$pars.history))][-1])
+  
+  Fplot_df = data.frame(names = c("Initialization", paste("+ ", sep = "", metaclust_gate$active_channels)),
+                        f_values = f_values_vs_number_of_parameters) %>%
+    arrange(desc(f_values)) %>%
+    mutate(names = factor(names, levels = names)) 
+    
+  ggplot(Fplot_df, aes(y = f_values, x = names)) +
+           geom_bar(stat="identity") + coord_flip() +
+    labs(y = "Cumulative F1-score", x = "")
+  ggsave(filename = paste(default_path, "Fplot.pdf", sep = "_"), height = 5, width = 7)
+  
+  # Look at contributions of each marker for optimization       
+  contributions = channels_contributions(gate = metaclust_gate, xp = xp_mat, gate_vector = gate_vect, 
+      level = metaclust_of_interest, beta = 1)
+
+  contrib_plot_df = data.frame(contributions) %>%
+    rownames_to_column(var = "name") %>%
+    arrange(contributions) %>%
+    mutate(name = factor(name, levels = name)) 
+  
+  ggplot(contrib_plot_df, aes(y = contributions, x = name)) +
+           geom_bar(stat="identity") + coord_flip() +
+    labs(y = "F1-score deterioration when the parameter is ignored", x = "")
+  ggsave(filename = paste(default_path, "contrib_plot.pdf", sep = "_"), height = 5, width = 7)
+
+  # Refine initial gating
+  # metaclust_gate_opt = reoptimize_strategy(gate = metaclust_gate, 
+  #                                           channels_subset =  
+  #                                             as.character(contrib_plot_df$name[contrib_plot_df$contributions>0.001]),
+  #                                           xp = xp_mat,  gate_vector = gate_vect, level = metaclust_of_interest)
+  # 
+  # plot_gating_strategy(gate = metaclust_gate_opt, xp = xp_mat, gate_vector = gate_vect, 
+  #     level = metaclust_of_interest, highlight = "firebrick3", 
+  #     path = paste(default_path, "optimized_strategy.png", sep = "_"))
+
+}
+
+# Run hypergate on selected clusters
+lapply(metaclusters_for_hypergate, create_gates)
+
+```
+
+
+##============================================
+## Plot cell distribution across metaclusters
+##============================================
+
+
+```{r mosaic_plots}
+# Organize data
+mosaic_data = events_w_metaclust %>%
+  dplyr::select(samp, tmr_pos, metacluster) 
+  
+
+total_cd8_mosaic = mosaic_data %>%
+  dplyr::filter(tmr_pos == "no")
+
+# Plot total CD8+ data
+ggplot(data = total_cd8_mosaic) +
+    geom_mosaic(aes(x = product(metacluster, tmr_pos), fill=metacluster), na.rm=TRUE) + 
+    labs(y = "", x = " ", title='CD8+ phenotypes\nfrom all subjects') +
+    scale_fill_manual("Metacluster", values = all_tmr_zscore_anno_colors$group) + 
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text.x = element_blank(),
+          axis.ticks.x = element_blank())
+ggsave(filename = paste0(fname_prefix_mosaic, "summary_of_all_CD8s_all_subj.png"),
+       width = 4, height = 6)
+
+ggplot(data = total_cd8_mosaic) +
+    geom_mosaic(aes(x = product(metacluster, samp), fill=metacluster), na.rm=TRUE) + 
+    labs(y = "", x = " ", title='CD8+ phenotypes from each subject') +
+    scale_fill_manual("Metacluster", values = all_tmr_zscore_anno_colors$group) + 
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank())
+ggsave(filename = paste0(fname_prefix_mosaic, "summary_of_all_CD8s_by_subj.png"),
+       width = 9, height = 6)
+
+# Plot cell distribution summaries by specificity across all subjects & by each subject  
+plot_tmr_summary = function(tmr_spec, mosaic_df, size_filter = T){
+  if(size_filter == T){
+    filtered_data = mosaic_df %>%
+      dplyr::filter(tmr_pos == tmr_spec) %>%
+      if(tmr_spec == "islet") {
+        dplyr::filter(samp %in% tmr_by_subj$subject[tmr_by_subj$Islet_tot >= n_metaclusters])
+      } else if(tmr_spec == "insulin") {
+        dplyr::filter(samp %in% tmr_by_subj$subject[tmr_by_subj$Insulin_tot >= n_metaclusters])
+      } else if(tmr_spec == "viral") {
+        dplyr::filter(samp %in% tmr_by_subj$subject[tmr_by_subj$Virus_tot >= n_metaclusters])
+      } %>%
+      droplevels()
+  } else {
+    filtered_data = filtered_data = mosaic_df %>%
+      dplyr::filter(tmr_pos == tmr_spec)
+  }
+  
+  
+  ggplot(data = filtered_data) +
+      geom_mosaic(aes(x = product(metacluster, tmr_pos), fill=metacluster), na.rm=TRUE) + 
+      labs(y = "", x = " ", title=paste(tmr_spec, 'Tmr+ phenotypes\nfrom all subjects')) +
+      scale_fill_manual("Metacluster", values = all_tmr_zscore_anno_colors$group) + 
+      theme(plot.title = element_text(hjust = 0.5),
+            axis.text.y = element_blank(),
+            axis.ticks.y = element_blank())
+  ggsave(filename = paste0(fname_prefix_mosaic, "summary_of_", tmr_spec, "_all_subj.png"), 
+         width = 4, height = 6)
+  
+  ggplot(data = filtered_data) +
+    geom_mosaic(aes(x = product(metacluster, samp), fill=metacluster), na.rm=TRUE) + 
+    labs(y = "", x = " ", title=paste(tmr_spec, 'Tmr+ phenotypes\nfrom each subject')) +
+    scale_fill_manual("Metacluster", values = all_tmr_zscore_anno_colors$group) + 
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank())
+  ggsave(filename = paste0(fname_prefix_mosaic, "summary_of_", tmr_spec, "_by_subj.png"),
+         width = 9, height = 6)
+}
+
+## Ideally, you should set size_filter = T here.  My sample data didn't have a sufficient number of Tmr+ cells
+lapply(c("islet", "viral", "insulin"), plot_tmr_summary, mosaic_data, size_filter = F)
+
+```
+
